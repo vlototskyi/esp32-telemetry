@@ -5,11 +5,15 @@
 #include <DHT.h>
 #include "driver/rtc_io.h"
 #include <time.h>
+#include "mbedtls/sha256.h"
+#include "mbedtls/pk.h"
+#include "mbedtls/base64.h"
 
 const char* ssid = "*****";
 const char* password = "*****";
 
 const char* device_id  = "esp32-dht01";
+const char* key_id     = "esp32-dht01-key"; 
 const char* mqtt_server = "raspberrypi.local";
 const int   mqtt_port   = 8883;
 const char* client_id   = device_id;
@@ -50,9 +54,7 @@ void safe_sleep() {
 
 bool ensureTime(uint32_t timeout_ms = 2000) {
   time_t now = time(nullptr);
-  if (now > 1609459200) {
-    return true;
-  }
+  if (now > 1609459200) return true;
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   uint32_t start = millis();
   while ((millis() - start) < timeout_ms) {
@@ -70,6 +72,89 @@ String nowISO8601() {
   char buf[32];
   strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
   return String(buf);
+}
+
+String signPayload(const String& message, const String& keyPEM) {
+  mbedtls_pk_context pk;
+  mbedtls_pk_init(&pk);
+
+  mbedtls_entropy_context entropy;
+  mbedtls_ctr_drbg_context ctr_drbg;
+  mbedtls_entropy_init(&entropy);
+  mbedtls_ctr_drbg_init(&ctr_drbg);
+
+  const char *pers = "rsa_sign";
+  int ret;
+
+  ret = mbedtls_ctr_drbg_seed(
+      &ctr_drbg,
+      mbedtls_entropy_func,
+      &entropy,
+      (const unsigned char*)pers,
+      strlen(pers)
+  );
+
+  if (ret != 0) {
+    Serial.printf("DRBG seed failed: -0x%04X\n", -ret);
+    return "";
+  }
+
+  ret = mbedtls_pk_parse_key(
+      &pk,
+      (const unsigned char*)keyPEM.c_str(),
+      keyPEM.length() + 1,
+      NULL,
+      0,
+      mbedtls_ctr_drbg_random,
+      &ctr_drbg
+  );
+
+  if (ret != 0) {
+    Serial.printf("Key parse failed: -0x%04X\n", -ret);
+    return "";
+  }
+
+  unsigned char hash[32];
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+
+  mbedtls_sha256_starts(&sha, 0);
+  mbedtls_sha256_update(&sha,
+      (const unsigned char*)message.c_str(),
+      message.length());
+  mbedtls_sha256_finish(&sha, hash);
+
+  mbedtls_sha256_free(&sha);
+
+  unsigned char sig[512];
+  size_t sig_len = 0;
+
+  ret = mbedtls_pk_sign(
+      &pk,
+      MBEDTLS_MD_SHA256,
+      hash,
+      sizeof(hash),
+      sig,
+      sizeof(sig),
+      &sig_len,
+      mbedtls_ctr_drbg_random,
+      &ctr_drbg
+  );
+
+  if (ret != 0) {
+    Serial.printf("Sign failed: -0x%04X\n", -ret);
+    return "";
+  }
+
+  unsigned char b64[1024];
+  size_t b64_len = 0;
+  mbedtls_base64_encode(b64, sizeof(b64), &b64_len, sig, sig_len);
+
+  mbedtls_pk_free(&pk);
+  mbedtls_ctr_drbg_free(&ctr_drbg);
+  mbedtls_entropy_free(&entropy);
+
+  return String((char*)b64);
 }
 
 void setup() {
@@ -135,23 +220,34 @@ void setup() {
   time_t epoch = time(nullptr);
   String iso = nowISO8601();
 
-  char payload[360];
-  snprintf(payload, sizeof(payload),
-           "{\"device_id\":\"%s\",\"ts\":\"%s\",\"ts_epoch\":%ld,"
-           "\"temperature\":%.2f,\"humidity\":%.2f}",
-           device_id, iso.c_str(), (long)epoch, t, h);
+  String msg = String("{\"device_id\":\"") + device_id +
+               "\",\"ts\":\"" + iso + "\",\"ts_epoch\":" + String((long)epoch) +
+               ",\"temperature\":" + String(t, 2) +
+               ",\"humidity\":" + String(h, 2) + "}";
 
-  if (client.publish("esp32/sensors/dht", payload)) {
-    Serial.printf("Published: %s\n", payload);
-    client.loop();
-    delay(200);
+
+  String signature = signPayload(msg, clientKey);
+  if (signature == "") {
+    Serial.println("Signing failed");
+    safe_sleep();
+  }
+
+  String fullPayload = String("{\"device_id\":\"") + device_id + 
+                       "\",\"ts\":\"" + iso + "\",\"ts_epoch\":" + String((long)epoch) +
+                       ",\"temperature\":" + String(t, 2) +
+                       ",\"humidity\":" + String(h, 2) +
+                       ",\"sig\":\"" + signature + "\"" +
+                       ",\"key_id\":\"" + key_id + "\"}";
+
+  if (client.publish("esp32/sensors/dht", fullPayload.c_str())) {
+    Serial.printf("Published: %s\n", fullPayload.c_str());
   } else {
     Serial.println("Publish failed");
   }
-  client.disconnect();
-  delay(100);
 
+  client.disconnect();
+  delay(200);
   safe_sleep();
 }
 
-void loop() { /* unused */ }
+void loop() {}

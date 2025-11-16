@@ -3,11 +3,15 @@
 #include <WiFiClientSecure.h>
 #include <LittleFS.h>
 #include <time.h>
+#include "mbedtls/sha256.h"
+#include "mbedtls/pk.h"
+#include "mbedtls/base64.h"
 
 const char* ssid = "*****";
 const char* password = "*****";
 
 const char* device_id  = "esp32-sound01";
+const char* key_id     = "esp32-sound01-key";
 const char* mqtt_server = "raspberrypi.local";
 const int   mqtt_port   = 8883;
 const char* client_id   = device_id;
@@ -16,13 +20,12 @@ WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
 #define SOUND_PIN 34
-
 #define uS_TO_S_FACTOR 1000000ULL
 #define TIME_TO_SLEEP  60
 
 const int MEAS_WINDOW_MS = 3000;
-const int SEGMENT_MS     = 50; 
-const int SAMPLE_US      = 200; 
+const int SEGMENT_MS     = 50;
+const int SAMPLE_US      = 200;
 const int SAMPLES_PER_SEG = (SEGMENT_MS * 1000) / SAMPLE_US;
 
 static const char* FLOOR_FILE = "/sound_floor.txt";
@@ -79,15 +82,12 @@ void measureWindow(int &rms_avg_out, int &rms_peak_out) {
     }
     total_sumSq   += seg_sumSq;
     total_samples += SAMPLES_PER_SEG;
-
     int seg_rms = (int)sqrt((double)seg_sumSq / SAMPLES_PER_SEG);
     if (seg_rms > rms_peak) rms_peak = seg_rms;
   }
-
   int rms_avg = (total_samples > 0)
                   ? (int)sqrt((double)total_sumSq / total_samples)
                   : 0;
-
   rms_avg_out  = rms_avg;
   rms_peak_out = rms_peak;
 }
@@ -98,6 +98,89 @@ int loadFloor() {
   return s.toInt();
 }
 void saveFloor(int floorRMS) { writeFile(FLOOR_FILE, String(floorRMS)); }
+
+String signPayload(const String& message, const String& keyPEM) {
+  mbedtls_pk_context pk;
+  mbedtls_pk_init(&pk);
+
+  mbedtls_entropy_context entropy;
+  mbedtls_ctr_drbg_context ctr_drbg;
+  mbedtls_entropy_init(&entropy);
+  mbedtls_ctr_drbg_init(&ctr_drbg);
+
+  const char *pers = "rsa_sign";
+  int ret;
+
+  ret = mbedtls_ctr_drbg_seed(
+      &ctr_drbg,
+      mbedtls_entropy_func,
+      &entropy,
+      (const unsigned char*)pers,
+      strlen(pers)
+  );
+
+  if (ret != 0) {
+    Serial.printf("DRBG seed failed: -0x%04X\n", -ret);
+    return "";
+  }
+
+  ret = mbedtls_pk_parse_key(
+      &pk,
+      (const unsigned char*)keyPEM.c_str(),
+      keyPEM.length() + 1,
+      NULL,
+      0,
+      mbedtls_ctr_drbg_random,
+      &ctr_drbg
+  );
+
+  if (ret != 0) {
+    Serial.printf("Key parse failed: -0x%04X\n", -ret);
+    return "";
+  }
+
+  unsigned char hash[32];
+  mbedtls_sha256_context sha;
+  mbedtls_sha256_init(&sha);
+
+  mbedtls_sha256_starts(&sha, 0);
+  mbedtls_sha256_update(&sha,
+      (const unsigned char*)message.c_str(),
+      message.length());
+  mbedtls_sha256_finish(&sha, hash);
+
+  mbedtls_sha256_free(&sha);
+
+  unsigned char sig[512];
+  size_t sig_len = 0;
+
+  ret = mbedtls_pk_sign(
+      &pk,
+      MBEDTLS_MD_SHA256,
+      hash,
+      sizeof(hash),
+      sig,
+      sizeof(sig),
+      &sig_len,
+      mbedtls_ctr_drbg_random,
+      &ctr_drbg
+  );
+
+  if (ret != 0) {
+    Serial.printf("Sign failed: -0x%04X\n", -ret);
+    return "";
+  }
+
+  unsigned char b64[1024];
+  size_t b64_len = 0;
+  mbedtls_base64_encode(b64, sizeof(b64), &b64_len, sig, sig_len);
+
+  mbedtls_pk_free(&pk);
+  mbedtls_ctr_drbg_free(&ctr_drbg);
+  mbedtls_entropy_free(&entropy);
+
+  return String((char*)b64);
+}
 
 void setup_wifi() {
   Serial.printf("Connecting to %s", ssid);
@@ -134,9 +217,9 @@ void setup() {
   if (floorRMS < 0) {
     floorRMS = preRMS;
   } else {
-    if (preRMS < floorRMS) {
+    if (preRMS < floorRMS)
       floorRMS = (int)((1.0f - FLOOR_ALPHA) * floorRMS + FLOOR_ALPHA * preRMS);
-    } else {
+    else {
       float alphaUp = FLOOR_ALPHA * 0.5f;
       floorRMS = (int)((1.0f - alphaUp) * floorRMS + alphaUp * preRMS);
     }
@@ -170,11 +253,8 @@ void setup() {
   int percent_avg  = min(100, (delta_avg  * 100) / SPAN);
   int percent_peak = min(100, (delta_peak * 100) / SPAN);
 
-  Serial.printf("🎤 floor=%d, rms_avg=%d, rms_peak=%d, "
-                "delta_avg=%d, delta_peak=%d, "
-                "pct_avg=%d%%, pct_peak=%d%%\n",
-                floorRMS, rms_avg, rms_peak,
-                delta_avg, delta_peak, percent_avg, percent_peak);
+  Serial.printf("🎤 floor=%d, rms_avg=%d, rms_peak=%d, pct_avg=%d%%, pct_peak=%d%%\n",
+                floorRMS, rms_avg, rms_peak, percent_avg, percent_peak);
 
   if (!client.connected()) {
     Serial.print("Connecting to MQTT...");
@@ -188,31 +268,46 @@ void setup() {
   time_t epoch = time(nullptr);
   String iso = nowISO8601();
 
-  char payload[480];
-  snprintf(payload, sizeof(payload),
-           "{\"device_id\":\"%s\",\"ts\":\"%s\",\"ts_epoch\":%ld,"
-           "\"sound_floor\":%d,"
-           "\"sound_rms_avg\":%d,\"sound_rms_peak\":%d,"
-           "\"sound_delta_avg\":%d,\"sound_delta_peak\":%d,"
-           "\"sound_percent_avg\":%d,\"sound_percent_peak\":%d,"
-           "\"win_ms\":%d,\"seg_ms\":%d}",
-           device_id, iso.c_str(), (long)epoch,
-           floorRMS,
-           rms_avg, rms_peak,
-           delta_avg, delta_peak,
-           percent_avg, percent_peak,
-           MEAS_WINDOW_MS, SEGMENT_MS);
+  String msg = String("{\"device_id\":\"") + device_id +
+               "\",\"ts\":\"" + iso + "\",\"ts_epoch\":" + String((long)epoch) +
+               ",\"sound_floor\":" + String(floorRMS) +
+               ",\"sound_rms_avg\":" + String(rms_avg) +
+               ",\"sound_rms_peak\":" + String(rms_peak) +
+               ",\"sound_delta_avg\":" + String(delta_avg) +
+               ",\"sound_delta_peak\":" + String(delta_peak) +
+               ",\"sound_percent_avg\":" + String(percent_avg) +
+               ",\"sound_percent_peak\":" + String(percent_peak) +
+               ",\"win_ms\":" + String(MEAS_WINDOW_MS) +
+               ",\"seg_ms\":" + String(SEGMENT_MS) + "}";
 
-  if (client.publish("esp32/sensors/sound", payload)) {
-    Serial.printf("Published: %s\n", payload);
-    client.loop();
-    delay(200);
+  String signature = signPayload(msg, clientKey);
+  if (signature == "") {
+    Serial.println("Signing failed");
+    safe_sleep();
+  }
+
+  String fullPayload = String("{\"device_id\":\"") + device_id +
+                       "\",\"ts\":\"" + iso + "\",\"ts_epoch\":" + String((long)epoch) +
+                       ",\"sound_floor\":" + String(floorRMS) +
+                       ",\"sound_rms_avg\":" + String(rms_avg) +
+                       ",\"sound_rms_peak\":" + String(rms_peak) +
+                       ",\"sound_delta_avg\":" + String(delta_avg) +
+                       ",\"sound_delta_peak\":" + String(delta_peak) +
+                       ",\"sound_percent_avg\":" + String(percent_avg) +
+                       ",\"sound_percent_peak\":" + String(percent_peak) +
+                       ",\"win_ms\":" + String(MEAS_WINDOW_MS) +
+                       ",\"seg_ms\":" + String(SEGMENT_MS) +
+                       ",\"sig\":\"" + signature + "\"" +
+                       ",\"key_id\":\"" + key_id + "\"}";
+
+  if (client.publish("esp32/sensors/sound", fullPayload.c_str())) {
+    Serial.printf("Published: %s\n", fullPayload.c_str());
   } else {
     Serial.println("Publish failed");
   }
+
   client.disconnect();
   delay(100);
-
   safe_sleep();
 }
 
